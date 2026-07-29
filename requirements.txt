@@ -1,0 +1,13 @@
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+statsmodels
+xarray
+scikit-learn
+ruptures
+pwlf
+openpyxl
+python-docx
+
