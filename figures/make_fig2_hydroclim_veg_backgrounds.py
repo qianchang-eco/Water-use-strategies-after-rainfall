@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,11 @@ ROOT = Path(os.environ.get("WATER_USE_DATA_ROOT", Path.cwd()))
 DATA = ROOT / "results_paper" / "ismn_results_star_th0_04may_ecosystem.csv"
 OUTDIR = ROOT / "plots"
 OUTDIR.mkdir(parents=True, exist_ok=True)
-OUTBASE = OUTDIR / "fig2_hydroclimatic_vegetation_backgrounds"
+OUTBASE = OUTDIR / "fig2_hydroclimatic_vegetation_backgrounds_unbounded_q"
+SUBMISSION_PNG = ROOT / "提交" / "Figures" / "Fig. 2.png"
+SUBMISSION_PNG.parent.mkdir(parents=True, exist_ok=True)
+SOURCE_DIR = OUTDIR / "fig2_unbounded_q_source_data"
+SOURCE_DIR.mkdir(parents=True, exist_ok=True)
 
 ECOS = ["forest", "savanna", "grassland"]
 ECO_LABELS = {"forest": "Forest", "savanna": "Savanna", "grassland": "Grassland"}
@@ -23,9 +28,9 @@ LINE_LABELS = {"low": "Low LAI (P25)", "median": "Median LAI (P50)", "high": "Hi
 DRIVER_ORDER = ["AI60", "LAI", "AI60 x LAI"]
 DRIVER_COLORS = {"AI60": "#b7cf3d", "LAI": "#35aa88", "AI60 x LAI": "#075f55"}
 DRIVER_LABELS = {"AI60": r"$AI_{60}$", "LAI": "LAI", "AI60 x LAI": r"$AI_{60}\times LAI$"}
-STATE_LABELS = ["Q1\nlower tail", "Q2\nlower-mid", "Q3\nupper-mid", "Q4\nupper tail"]
+STATE_LABELS = ["R1\nlower tail", "R2\nlower-mid", "R3\nupper-mid", "R4\nupper tail"]
 
-N_BOOT = 180
+N_BOOT = 500
 RNG = np.random.default_rng(20260626)
 
 mpl.rcParams.update(
@@ -78,7 +83,9 @@ def load_data():
     for col in ["q_q", "AI_60d", "LAI"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["ecosystem", "SITE_ID", "q_q", "AI_60d", "LAI"])
-    df = df[(df["q_q"] >= 0) & (df["AI_60d"] > 0) & (df["LAI"] >= 0)].copy()
+    # No upper q threshold is imposed in this figure. The log1p response keeps
+    # large positive q estimates from dominating the regression numerically.
+    df = df[(df["q_q"] >= 0.01) & (df["AI_60d"] > 0) & (df["LAI"] >= 0)].copy()
     return df
 
 
@@ -149,7 +156,7 @@ def fit_model(sub, ai_lim, lai_lim, site_boot_weights=None):
     work = work.loc[keep]
     weights = weights[keep]
 
-    y = np.log1p(work["q_q"].clip(0, 3.0).to_numpy(float))
+    y = np.log1p(work["q_q"].to_numpy(float))
     xmat = design_matrix(work["AI_60d"].to_numpy(), work["LAI"].to_numpy(), ai_lim, lai_lim)
     weights = weights / np.nanmean(weights)
     sw = np.sqrt(weights)
@@ -164,7 +171,55 @@ def fit_model(sub, ai_lim, lai_lim, site_boot_weights=None):
 
 def predict(beta, ai, lai, ai_lim, lai_lim):
     eta = design_matrix(ai, lai, ai_lim, lai_lim) @ beta
-    return np.clip(np.expm1(eta), 0, 3.05)
+    return np.maximum(np.expm1(eta), 0.01)
+
+
+def weighted_median(values, weights):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    keep = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    values, weights = values[keep], weights[keep]
+    if len(values) == 0:
+        return np.nan
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+    return float(values[np.searchsorted(np.cumsum(weights), weights.sum() / 2, side="left")])
+
+
+def empirical_bin_points(sub, lai_quantile, ai_lim, seed, n_bins=5):
+    """Site-level medians near a displayed LAI percentile, with cluster CIs."""
+    lower = max(0.0, lai_quantile - 0.125)
+    upper = min(1.0, lai_quantile + 0.125)
+    lai_lo, lai_hi = sub["LAI"].quantile([lower, upper]).to_numpy(float)
+    work = sub[sub["LAI"].between(lai_lo, lai_hi)
+               & sub["AI_60d"].between(*ai_lim)].copy()
+    work["ai_bin"] = pd.qcut(work["AI_60d"].rank(method="first"), n_bins,
+                             labels=False)
+    site_bin = (work.groupby(["SITE_ID", "ai_bin"], as_index=False)
+                .agg(AI60=("AI_60d", "median"), q=("q_q", "median")))
+    site_bin["SITE_ID"] = site_bin["SITE_ID"].astype(str)
+    sites = site_bin["SITE_ID"].drop_duplicates().to_numpy()
+    rows = []
+    for bin_id in range(n_bins):
+        g = site_bin[site_bin["ai_bin"].eq(bin_id)]
+        rows.append({"ai_bin": bin_id, "AI60": float(g["AI60"].median()),
+                     "q": float(g["q"].median()),
+                     "n_sites": int(g["SITE_ID"].nunique())})
+    points = pd.DataFrame(rows)
+    rng = np.random.default_rng(seed)
+    draws = np.full((N_BOOT, n_bins), np.nan)
+    for b in range(N_BOOT):
+        sampled = rng.choice(sites, size=len(sites), replace=True)
+        counts = pd.Series(sampled).value_counts()
+        multiplicity = site_bin["SITE_ID"].map(counts).fillna(0).to_numpy(float)
+        for bin_id in range(n_bins):
+            mask = site_bin["ai_bin"].eq(bin_id).to_numpy()
+            draws[b, bin_id] = weighted_median(site_bin.loc[mask, "q"], multiplicity[mask])
+    points["ci_low"], points["ci_high"] = np.nanquantile(draws, [0.025, 0.975], axis=0)
+    points["lai_quantile"] = lai_quantile
+    points["lai_band_low"] = lower
+    points["lai_band_high"] = upper
+    return points, site_bin
 
 
 def bootstrap_predictions(sub, ai_grid, lai_value, ai_lim, lai_lim, hull):
@@ -222,17 +277,6 @@ def add_site_rug(ax, sub, ai_lim):
 
 def add_state_labels(ax, ai_lim):
     ax.axhline(1, color="#626262", lw=0.9, ls=(0, (4, 2)), zorder=0)
-    pad = 0.025 * (ai_lim[1] - ai_lim[0])
-    label_style = dict(
-        fontsize=9.0,
-        fontweight="bold",
-        color="black",
-        bbox=dict(facecolor="white", edgecolor="none", alpha=0.86, pad=1.2),
-        zorder=8,
-    )
-    ax.text(ai_lim[0] + pad, 0.63, "aggressive", ha="left", va="center", **label_style)
-    ax.text(ai_lim[0] + pad, 1.15, "conservative", ha="left", va="center", **label_style)
-    ax.text(ai_lim[1] - pad, 1.06, "q = 1", ha="right", va="bottom", fontsize=8.5, color="black", zorder=8)
 
 
 def weighted_r2(y, yhat, weights):
@@ -267,6 +311,9 @@ def contribution_by_state(sub):
         else:
             site_counts = g["SITE_ID"].map(g["SITE_ID"].value_counts()).to_numpy(float)
             weights = 1.0 / site_counts
+            # Keep panels d-f identical to the original submitted figure.  The
+            # original contribution calculation winsorised q at 3 even though
+            # the revised response curves in panels a-c retain the full q range.
             y = np.log1p(g["q_q"].clip(0, 3.0).to_numpy(float))
             x_ai = g["AI_60d"].to_numpy(float)
             x_lai = g["LAI"].to_numpy(float)
@@ -293,6 +340,19 @@ def contribution_by_state(sub):
 
 
 df = load_data()
+pd.DataFrame([
+    {
+        "ecosystem": eco,
+        "events_q_ge_0.01": len(df[df["ecosystem"].eq(eco)]),
+        "sites": df.loc[df["ecosystem"].eq(eco), "SITE_ID"].nunique(),
+        "events_q_gt_3_retained": int((df.loc[df["ecosystem"].eq(eco), "q_q"] > 3).sum()),
+        "fraction_q_gt_3_retained": float((df.loc[df["ecosystem"].eq(eco), "q_q"] > 3).mean()),
+    }
+    for eco in ECOS
+]).to_csv(SOURCE_DIR / "fig2_unbounded_q_data_audit.csv", index=False)
+empirical_point_tables = []
+empirical_site_bin_tables = []
+curve_tables = []
 
 fig = plt.figure(figsize=(10.6, 6.05))
 gs = fig.add_gridspec(
@@ -319,19 +379,47 @@ for i, (ax, eco) in enumerate(zip(top_axes, ECOS)):
 
     for key, q in zip(LINE_ORDER, [0.25, 0.50, 0.75]):
         y, lo, hi = bootstrap_predictions(sub, ai_grid, lai_levels[q], ai_lim, lai_lim, hull)
+        curve_tables.append(pd.DataFrame({
+            "ecosystem": eco,
+            "lai_level": key,
+            "lai_value": float(lai_levels[q]),
+            "AI60": ai_grid,
+            "predicted_q": y,
+            "ci_low": lo,
+            "ci_high": hi,
+        }))
         ax.fill_between(ai_grid, lo, hi, where=np.isfinite(lo) & np.isfinite(hi), color=LINE_COLORS[key], alpha=0.12, lw=0)
         ax.plot(ai_grid, y, color=LINE_COLORS[key], lw=2.2, solid_capstyle="round")
+        points, site_bins = empirical_bin_points(
+            sub, q, ai_lim, seed=20261116 + i * 100 + int(q * 100)
+        )
+        points["ecosystem"] = eco
+        points["lai_level"] = key
+        site_bins["ecosystem"] = eco
+        site_bins["lai_level"] = key
+        empirical_point_tables.append(points)
+        empirical_site_bin_tables.append(site_bins)
+        errors = np.vstack([
+            points["q"].to_numpy(float) - points["ci_low"].to_numpy(float),
+            points["ci_high"].to_numpy(float) - points["q"].to_numpy(float),
+        ])
+        ax.errorbar(
+            points["AI60"], points["q"], yerr=errors, fmt="o",
+            color=LINE_COLORS[key], ecolor=LINE_COLORS[key], ms=4.0,
+            lw=0.9, capsize=2.0, markeredgecolor="white",
+            markeredgewidth=0.5, zorder=5,
+        )
 
     add_site_rug(ax, sub, ai_lim)
     add_state_labels(ax, ai_lim)
 
     ax.set_xlim(*ai_lim)
-    ax.set_ylim(0, 3.05)
+    ax.set_ylim(0, 10.05)
     ax.set_title(ECO_LABELS[eco], fontsize=11.2, fontweight="bold", pad=7)
     ax.set_xlabel(r"$AI_{60}$ (P/PET, preceding 60 d)", fontsize=9.5)
     if i == 0:
         ax.set_ylabel("Predicted q$_{original}$", fontsize=9.5)
-    ax.set_yticks([0, 1, 2, 3])
+    ax.set_yticks([0, 2, 4, 6, 8, 10])
     ax.tick_params(axis="both", labelsize=8.2, length=3)
     boxed_axes_no_grid(ax)
     if i == 1:
@@ -346,6 +434,16 @@ for i, (ax, eco) in enumerate(zip(top_axes, ECOS)):
             borderaxespad=0.0,
         )
     panel_label(ax, "abc"[i])
+
+pd.concat(empirical_point_tables, ignore_index=True).to_csv(
+    SOURCE_DIR / "fig2_empirical_bin_points.csv", index=False
+)
+pd.concat(empirical_site_bin_tables, ignore_index=True).to_csv(
+    SOURCE_DIR / "fig2_site_bin_source.csv", index=False
+)
+pd.concat(curve_tables, ignore_index=True).to_csv(
+    SOURCE_DIR / "fig2_model_curves_with_site_bootstrap_ci.csv", index=False
+)
 
 for i, (ax, eco) in enumerate(zip(bottom_axes, ECOS)):
     sub = df[df["ecosystem"].eq(eco)].copy()
@@ -390,7 +488,10 @@ for i, (ax, eco) in enumerate(zip(bottom_axes, ECOS)):
             display_label = DRIVER_LABELS[drv]
             if drv == "AI60 x LAI":
                 display_label = r"$AI_{60}$" + "\n" + r"$\times LAI$"
-            ax.text(xi, 104, display_label, ha="center", va="bottom", fontsize=6.0, color="#333333")
+            ax.text(
+                xi, 104, display_label,
+                ha="center", va="bottom", fontsize=6.0, color="#333333"
+            )
     ax.set_ylim(0, 116)
     ax.set_xlim(-0.55, 3.55)
     ax.set_xticks(x)
@@ -422,9 +523,28 @@ fig.legend(
     columnspacing=1.8,
 )
 
-for ext in [".png", ".pdf", ".svg"]:
-    fig.savefig(OUTBASE.with_suffix(ext), dpi=600 if ext == ".png" else None, bbox_inches="tight")
+fig.canvas.draw()
+audit_dir = os.environ.get("NATURE_FIGURE_AUDIT_DIR")
+if audit_dir:
+    sys.path.insert(0, audit_dir)
+    from audit_panel_alignment import require_matplotlib_panel_alignment
+    require_matplotlib_panel_alignment(
+        fig,
+        json_out=str(SOURCE_DIR / "fig2_unbounded_q.alignment.json"),
+        overlay_svg=str(SOURCE_DIR / "fig2_unbounded_q.alignment.svg"),
+        tolerance_pt=1.5,
+        gutter_tolerance_pt=1.5,
+        require_panel_labels=True,
+        strict=True,
+    )
+
+fig.savefig(OUTBASE.with_suffix(".png"), dpi=600, bbox_inches="tight")
+fig.savefig(OUTBASE.with_suffix(".tiff"), dpi=600, bbox_inches="tight")
+fig.savefig(OUTBASE.with_suffix(".pdf"), bbox_inches="tight")
+fig.savefig(OUTBASE.with_suffix(".svg"), bbox_inches="tight")
+fig.savefig(SUBMISSION_PNG, dpi=600, bbox_inches="tight")
 
 print(OUTBASE.with_suffix(".png"))
 print(OUTBASE.with_suffix(".pdf"))
 print(OUTBASE.with_suffix(".svg"))
+print(SUBMISSION_PNG)

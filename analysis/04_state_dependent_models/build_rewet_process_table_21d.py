@@ -40,7 +40,7 @@ def build_table(
     rewet = rewet[rewet["ecosystem"].eq(ecosystem)].copy()
 
     required = {
-        "file", "SITE_ID", "q_original", "q_21", "q_21_start", "q_21_end",
+        "file", "event_id", "SITE_ID", "q_original", "q_21", "q_21_start", "q_21_end",
         "q_21_theta_peak", "q_21_theta_end", "q_21_theta_jump", "dpet_21",
     }
     missing = sorted(required - set(rewet.columns))
@@ -61,17 +61,26 @@ def build_table(
 
     first = pd.read_csv(
         first_csv,
-        usecols=["file", "ecosystem", "theta_star", "SWC", "ai"],
+        usecols=["file", "event_id", "ecosystem", "theta_star", "SWC", "ai"],
     )
     first = first[first["ecosystem"].eq(ecosystem)].copy()
+    key = ["file", "event_id"]
+    values = ["theta_star", "SWC", "ai"]
+    for column in values:
+        conflicts = first.groupby(key, dropna=False)[column].nunique(dropna=True)
+        if (conflicts > 1).any():
+            raise ValueError(f"Conflicting {column} for {(conflicts > 1).sum()} antecedent events")
     first = first.rename(columns={
         "theta_star": "theta_star_first",
         "SWC": "SWC_first",
         "ai": "ai_first",
-    }).drop_duplicates("file")
+    }).drop_duplicates(key)
     for col in ["theta_star_first", "SWC_first", "ai_first"]:
         first[col] = numeric(first[col])
-    rewet = rewet.merge(first, on="file", how="left")
+    before_join = len(rewet)
+    rewet = rewet.merge(first.drop(columns=["ecosystem"]), on=key, how="left", validate="many_to_one")
+    if len(rewet) != before_join:
+        raise AssertionError("Antecedent-state join changed the number of rewetting rows")
     rewet["exposure_depth_21"] = np.maximum(
         0, rewet["theta_star_first"] - rewet["q_21_theta_end"]
     )
@@ -90,7 +99,8 @@ def build_table(
     rewet["PET_max_21"] = pmax
 
     keep = [
-        "file", "SITE_ID", "q_original", "q_21", "dq_21", "duration_21",
+        "file", "event_id", "SITE_ID", "q_21_start", "q_21_end",
+        "q_original", "q_21", "dq_21", "duration_21",
         "drydown_rate_21", "exposure_depth_21", "dpet_21", "PET_p90_21",
         "PET_max_21", "theta_star_first", "SWC_first", "ai_first",
     ]

@@ -78,14 +78,30 @@ df_q["Sensor_ID"] = df_q["file"].apply(extract_sensor)
 # =======================================================
 df_meta = pd.read_csv(author_meta_path)
 
-# 只取需要的字段（避免重复）
+# Metadata are sensor-depth specific. A SITE_ID-only merge multiplies each
+# event by all monitored depths at that site (and changes downstream counts).
 df_meta_sub = df_meta[["SITE_ID", "z_m", "LC"]].drop_duplicates()
+ambiguous = df_meta_sub.duplicated(["SITE_ID", "z_m"], keep=False)
+if ambiguous.any():
+    examples = df_meta_sub.loc[ambiguous, ["SITE_ID", "z_m", "LC"]].head(8)
+    raise ValueError(
+        "Conflicting land-cover metadata for SITE_ID + sensor depth; "
+        f"resolve these records before joining:\n{examples.to_string(index=False)}"
+    )
 
 
 # =======================================================
 # 5) 进行 merge
 # =======================================================
-df = df_q.merge(df_meta_sub, on="SITE_ID", how="left")
+df = df_q.merge(
+    df_meta_sub,
+    left_on=["SITE_ID", "depth_from"],
+    right_on=["SITE_ID", "z_m"],
+    how="left",
+    validate="many_to_one",
+)
+if len(df) != len(df_q):
+    raise AssertionError("Ecosystem metadata join changed the number of q events")
 
 
 # =======================================================
@@ -123,4 +139,3 @@ print("完成！输出文件：", out_path)
 
 print("\n生态系统分类统计：")
 print(df["ecosystem"].value_counts())
-

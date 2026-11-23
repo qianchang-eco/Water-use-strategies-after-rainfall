@@ -1,6 +1,11 @@
 import numpy as np
 from scipy.optimize import least_squares
 
+# Legacy fitting wrapper. The analytical curve below now matches the referenced
+# q loss function and its mm/day-to-metre conversion, but fit_one_event still
+# has a hard-coded ETmax ceiling (10 mm/day). It is not a complete replacement
+# for the upstream PET-constrained fitting workflow or a final manuscript fit.
+
 def theta_model(t, theta0, theta_w, theta_star, ETmax, q, delta_z):
     """
     论文公式（4），q ≠ 1 情况。
@@ -9,11 +14,17 @@ def theta_model(t, theta0, theta_w, theta_star, ETmax, q, delta_z):
     # 防止负值或无效范围
     if q == 1:
         # 线性情况（论文公式3）
-        k = ETmax / (delta_z * (theta_star - theta_w))
+        # ETmax is mm/day; delta_z is metres. Convert depth to mm first.
+        k = ETmax / (delta_z * 1000 * (theta_star - theta_w))
         return (theta0 - theta_w) * np.exp(-k * t) + theta_w
     
     # 非线性情况
-    A = - ETmax * (1 - q) * (theta_star - theta_w)**q / delta_z
+    # Integrating dtheta/dt = -(ETmax/delta_z) *
+    # ((theta - theta_w)/(theta_star - theta_w))**q gives a denominator
+    # (theta_star - theta_w)**q. The former multiplication here was not
+    # algebraically equivalent to the referenced drydowns q_model. ETmax is
+    # mm/day whereas delta_z is metres, so k=ETmax/(1000*delta_z).
+    A = -ETmax * (1 - q) / (1000 * delta_z * (theta_star - theta_w)**q)
     inner = A * t + (theta0 - theta_w)**(1 - q)
     
     inner = np.maximum(inner, 1e-12)  # 防止开方负数
@@ -80,4 +91,3 @@ def fit_one_event(t, theta, theta_w, theta_fc, delta_z=0.2):
         "q": float(q),
         "r2": float(r2)
     }
-
